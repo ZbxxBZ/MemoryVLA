@@ -1,6 +1,7 @@
+import json
 import os
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 import draccus
 import numpy as np
 import tqdm
@@ -35,6 +36,16 @@ class GenerateConfig:
     seed: int = 7 # Random Seed (for reproducibility)
     resolution: Union[int, tuple] = 256 # Image resolution for model input
     port: int = 6800
+    save_video: bool = True # Save a replay video per episode
+
+    # Cross-episode experience probe (requires `episode_api`, i.e. a server with /start_episode and /end_episode)
+    episode_api: bool = False # Call /start_episode and /end_episode around every episode
+    init_ids: Optional[List[int]] = None # Initial states to run (default: the first `num_trials_per_task`)
+    trials_per_init: int = 1 # Rollouts per initial state
+    seed_offset: int = 0 # Offset of the per-episode seed; use a fresh offset for evaluation runs
+    exp_mode: str = "none" # none | other_init_success | same_init_success | same_init_failure
+    exp_k: int = 1 # Number of experiences to prefill
+    record_experience: bool = False # Save this run's episodes into the server's experience store
     # fmt: on
 
 
@@ -42,6 +53,10 @@ class GenerateConfig:
 def eval_libero(cfg: GenerateConfig) -> None:
     if cfg.spcial_task_id is not None and isinstance(cfg.spcial_task_id, int):
         cfg.spcial_task_id = [cfg.spcial_task_id]
+    if cfg.init_ids is not None and isinstance(cfg.init_ids, int):
+        cfg.init_ids = [cfg.init_ids]
+    if cfg.exp_mode != "none" or cfg.record_experience:
+        assert cfg.episode_api, "`exp_mode` / `record_experience` require `--episode_api True`"
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
@@ -52,6 +67,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
+    results_filepath = os.path.join(cfg.local_log_dir, run_id + "_results.jsonl")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -87,18 +103,31 @@ def eval_libero(cfg: GenerateConfig) -> None:
         env, task_description = get_libero_env(task, resolution=256)
 
         # Start episodes
+        init_ids = cfg.init_ids if cfg.init_ids is not None else list(range(cfg.num_trials_per_task))
+        episode_list = [(init_id, trial) for init_id in init_ids for trial in range(cfg.trials_per_init)]
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+        for init_id, trial in tqdm.tqdm(episode_list):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
+
+            # Same (task, init, trial) => same seed across experience modes, so runs can be paired
+            episode_seed = cfg.seed_offset + task_id * 100000 + init_id * 100 + trial
 
             # Reset environment
             env.reset()
             policy.reset()
             episode_first_frame = 'True'
+            if cfg.episode_api:
+                exp_info = policy.start_episode(
+                    suite=cfg.task_suite_name, task_id=task_id, init_id=init_id, trial=trial, seed=episode_seed,
+                    exp_mode=cfg.exp_mode, exp_k=cfg.exp_k, record=cfg.record_experience,
+                )
+                print(f"Pinned experiences: {exp_info}")
+                log_file.write(f"Pinned experiences: {exp_info}\n")
 
             # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            obs = env.set_init_state(initial_states[init_id])
+            done = False
 
             # Setup
             t = 0
@@ -190,14 +219,25 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
 
+            if cfg.episode_api:
+                policy.end_episode(done, env_steps=t)
+            with open(results_filepath, "a") as f:
+                f.write(json.dumps({
+                    "suite": cfg.task_suite_name, "task_id": task_id, "task": task_description,
+                    "init_id": init_id, "trial": trial, "seed": episode_seed, "seed_offset": cfg.seed_offset,
+                    "exp_mode": cfg.exp_mode, "exp_k": cfg.exp_k, "record": cfg.record_experience,
+                    "success": bool(done), "env_steps": t,
+                }) + "\n")
+
             # Save a replay video of the episode
-            rollout_dir = os.path.join(cfg.local_log_dir, run_id + "_videos")
-            save_rollout_video(
-                replay_images, total_episodes,
-                success=done, task_description=task_description,
-                log_file=log_file,
-                rollout_dir=rollout_dir,
-            )
+            if cfg.save_video:
+                rollout_dir = os.path.join(cfg.local_log_dir, run_id + "_videos")
+                save_rollout_video(
+                    replay_images, total_episodes,
+                    success=done, task_description=task_description,
+                    log_file=log_file,
+                    rollout_dir=rollout_dir,
+                )
 
             # Log current results
             print(f"Success: {done}")

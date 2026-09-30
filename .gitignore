@@ -147,3 +147,8 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+# Experience-prefill probe outputs (kept locally, not versioned)
+log/
+exp_store/
+resized_image.png

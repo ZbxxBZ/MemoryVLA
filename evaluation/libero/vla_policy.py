@@ -11,6 +11,13 @@ class LLaVAClient:
         # return requests.post(self.base_url+"/reset").json().get('response')
         pass
 
+    def start_episode(self, **meta):
+        # meta: suite, task_id, init_id, trial, seed, exp_mode, exp_k, record
+        return requests.post(self.base_url + "/start_episode", json=meta).json()
+
+    def end_episode(self, success, **info):
+        return requests.post(self.base_url + "/end_episode", json={"success": bool(success), "info": info}).json()
+
     def process_frame(self, text, episode_first_frame, **kwargs):
         state = kwargs.pop('states', None)
         if state is not None:

@@ -142,6 +142,8 @@ class GateFusion(nn.Module):
         self.proj = nn.Linear(dim * 2, dim)
         nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.proj.bias, mean=0.0, std=1e-3)
+        self.collect_diag = False
+        self.last_scale_mean = None
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         scale = torch.sigmoid(
@@ -150,6 +152,8 @@ class GateFusion(nn.Module):
                 dim=-1)
             )
         )
+        if self.collect_diag:
+            self.last_scale_mean = float(scale.detach().float().mean().item())
 
         fused = scale * x1 + (1 - scale) * x2
         return fused
@@ -197,12 +201,23 @@ class CogMemBank(nn.Module):
         else:
             self.timestep_encoder = None
 
+        # pinned = [(timestep, feat[N,D]), ...], prepended to every episode's history at retrieval time;
+        # never consolidated or evicted, and untouched by `reset()` (used for cross-episode experience prefill)
+        self.pinned = []
+        self.exp_diag_enabled = False
+        self.last_diagnostics = {"attention_share": 0.0, "uniform_share": 0.0, "gate_scale": None}
         self.reset()
 
     def reset(self):
         # bank[episode_id] = [(timestep, feat[N,D]), ...]
         self.bank = {}
         self.eid_stream = None
+
+    def set_pinned(self, entries):
+        self.pinned = list(entries)
+
+    def clear_pinned(self):
+        self.pinned = []
 
     def clear_episode(self, episode_id):
         self.bank.pop(episode_id, None)
@@ -289,22 +304,38 @@ class CogMemBank(nn.Module):
 
             # 2) memory retrieval
             working_mem = tokens[i].unsqueeze(0)  # (1, N, D)
+            self.last_diagnostics = {"attention_share": 0.0, "uniform_share": 0.0, "gate_scale": None}
 
-            hist = self.bank.get(eid, [])
+            hist = self.pinned + self.bank.get(eid, [])
             if len(hist) > 0:
                 hist_feats = [feat for _, feat in hist]
                 episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)  # (1, T*N, D)
 
                 if self.use_timestep_pe:
                     hist_timesteps = [t for t, _ in hist]
-                    hist_timesteps = torch.tensor(hist_timesteps).to(working_mem.device)
+                    # Pinned entries may carry CUDA scalar tensors; stack them explicitly
+                    # instead of rebuilding a tensor from a mixed list of devices/dtypes.
+                    hist_timesteps = torch.stack([
+                        t if isinstance(t, torch.Tensor) else torch.as_tensor(t)
+                        for t in hist_timesteps
+                    ]).to(device=working_mem.device, dtype=torch.long)
                     pe = self.timestep_encoder(hist_timesteps).unsqueeze(0)  # (1, T, D)
                     pe = pe.repeat_interleave(N, dim=1) # (1, T*N, D)
                 else:
                     pe = torch.zeros_like(episode_mem)
 
                 query = working_mem
-                for block in self.retrieval_blocks:
+                for layer_idx, block in enumerate(self.retrieval_blocks):
+                    if self.exp_diag_enabled and layer_idx == 0 and len(self.pinned):
+                        q = block.q_proj(query).float()
+                        k = block.k_proj(episode_mem + pe).float()
+                        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D), dim=-1)
+                        pinned_keys = sum(feat.shape[0] for _, feat in self.pinned)
+                        pinned_keys = min(pinned_keys, weights.shape[-1])
+                        self.last_diagnostics["attention_share"] = float(
+                            weights[..., :pinned_keys].sum(-1).mean().detach().item()
+                        )
+                        self.last_diagnostics["uniform_share"] = float(pinned_keys / weights.shape[-1])
                     query = block(query, episode_mem + pe, episode_mem)
 
                 retrieved_episode_mem = query
@@ -318,6 +349,8 @@ class CogMemBank(nn.Module):
                 fused_feats = (working_mem + retrieved_episode_mem) * 0.5
             elif self.fusion_type == 'gate':
                 fused_feats = self.gate_fusion_blocks(working_mem, retrieved_episode_mem)
+                if self.exp_diag_enabled:
+                    self.last_diagnostics["gate_scale"] = self.gate_fusion_blocks.last_scale_mean
 
             outputs.append(fused_feats)
 
@@ -697,6 +730,10 @@ class MemoryVLA(nn.Module):
         use_ddim: bool = False,
         num_ddim_steps: int = 10,
         episode_first_frame: str = 'False',
+        timestep_stride: int = 1,
+        return_features: bool = False,
+        preserve_unmasked_actions: bool = False,
+        _skip_exp_diag: bool = False,
         **kwargs: str
     ) -> np.ndarray:
         """
@@ -709,6 +746,8 @@ class MemoryVLA(nn.Module):
         @param cfg_scale: Scaling factor for classifier-free guidance (CFG); if == 1.0, CFG is disabled.
         @param use_ddim: Use DDIM sampling instead of DDPM sampling.
         @param num_ddim_steps: Number of DDIM steps to use for sampling.
+        @param timestep_stride: Increment of the memory timestep per call (e.g. the number of executed actions).
+        @param return_features: Also return the raw (pre-memory) cognitive / perceptual tokens of this frame.
 
         @return Unnormalized (continuous) action vector --> end-effector deltas.
         """
@@ -768,9 +807,47 @@ class MemoryVLA(nn.Module):
             self.per_mem_bank.reset()
             self.cur_timestep = 0
 
+        action_offset = None
+        if getattr(self, "exp_diag_enabled", False) and not _skip_exp_diag:
+            cog_bank, per_bank = self.cog_mem_bank, self.per_mem_bank
+            saved_cog_bank = {key: list(value) for key, value in cog_bank.bank.items()}
+            saved_per_bank = {key: list(value) for key, value in per_bank.bank.items()}
+            saved_cur_timestep = self.cur_timestep
+            saved_cog_pinned, saved_per_pinned = list(cog_bank.pinned), list(per_bank.pinned)
+            saved_rng = torch.get_rng_state()
+            saved_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            saved_cog_diag, saved_per_diag = cog_bank.exp_diag_enabled, per_bank.exp_diag_enabled
+            cog_bank.exp_diag_enabled = per_bank.exp_diag_enabled = False
+            cog_bank.clear_pinned()
+            per_bank.clear_pinned()
+            try:
+                _, shadow_normalized = self.predict_action(
+                    image=image,
+                    instruction=instruction,
+                    unnorm_key=unnorm_key,
+                    cfg_scale=cfg_scale,
+                    use_ddim=use_ddim,
+                    num_ddim_steps=num_ddim_steps,
+                    episode_first_frame="False",
+                    timestep_stride=timestep_stride,
+                    preserve_unmasked_actions=preserve_unmasked_actions,
+                    _skip_exp_diag=True,
+                    **kwargs,
+                )
+            finally:
+                cog_bank.bank, per_bank.bank = saved_cog_bank, saved_per_bank
+                self.cur_timestep = saved_cur_timestep
+                cog_bank.set_pinned(saved_cog_pinned)
+                per_bank.set_pinned(saved_per_pinned)
+                cog_bank.exp_diag_enabled, per_bank.exp_diag_enabled = saved_cog_diag, saved_per_diag
+                torch.set_rng_state(saved_rng)
+                if saved_cuda_rng is not None:
+                    torch.cuda.set_rng_state_all(saved_cuda_rng)
+        raw_cog_tokens, raw_per_tokens = cog_tokens, per_tokens
+
         episode_ids = [0]
         timesteps = [torch.tensor(self.cur_timestep, device=cog_tokens.device)]
-        self.cur_timestep += 1
+        self.cur_timestep += timestep_stride
 
         cog_tokens = self.cog_mem_bank.process_batch(
             tokens=cog_tokens,
@@ -836,14 +913,32 @@ class MemoryVLA(nn.Module):
         action_norm_stats = self.get_action_stats(unnorm_key)
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
-        normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        if preserve_unmasked_actions:
+            normalized_actions = np.where(mask, np.clip(normalized_actions, -1, 1), normalized_actions)
+        else:
+            normalized_actions = np.clip(normalized_actions, -1, 1)
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
 
+        if getattr(self, "exp_diag_enabled", False) and not _skip_exp_diag:
+            action_offset = float(np.linalg.norm(normalized_actions - shadow_normalized))
+            self.last_exp_diagnostics = {
+                "cog_attention_share": self.cog_mem_bank.last_diagnostics["attention_share"],
+                "cog_uniform_share": self.cog_mem_bank.last_diagnostics["uniform_share"],
+                "cog_gate_scale": self.cog_mem_bank.last_diagnostics["gate_scale"],
+                "per_attention_share": self.per_mem_bank.last_diagnostics["attention_share"],
+                "per_uniform_share": self.per_mem_bank.last_diagnostics["uniform_share"],
+                "per_gate_scale": self.per_mem_bank.last_diagnostics["gate_scale"],
+                "action_offset_l2": action_offset,
+            }
+
+        if return_features:
+            features = {"cog": raw_cog_tokens[0, 0], "per": raw_per_tokens[0]}  # [D_cog], [N, D_per]
+            return actions, normalized_actions, features
         return actions, normalized_actions
 
 
