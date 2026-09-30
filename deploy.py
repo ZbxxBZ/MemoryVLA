@@ -1,4 +1,5 @@
 import json
+from functools import partial
 import numpy as np
 from PIL import Image
 from typing import Optional
@@ -13,7 +14,8 @@ import tempfile
 import torch
 
 from vla import load_vla
-from vla.experience import ExperienceStore
+from vla.experience import ExperienceStore, TaskExperienceLibrary
+from vla.task_memory import load_task_memory, scene_signature
 from evaluation.simpler_env.adaptive_ensemble import AdaptiveEnsembler
 
 app = Flask(__name__)
@@ -43,6 +45,9 @@ class MemVLAService:
         preserve_unmasked_actions: bool = False,
         exp_diag: bool = False,
         exp_diag_path: Optional[str] = None,
+        task_memory_ckpt: Optional[str] = None,
+        task_exp_path: Optional[list] = None,
+        task_same_scene_threshold: float = 0.995,
         args=None,
     ) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -55,6 +60,7 @@ class MemVLAService:
         kwargs = vars(args).copy()
         for k in [
             "model_id_or_path", "saved_model_path", "pretrained_checkpoint", "preserve_unmasked_actions",
+            "task_memory_ckpt", "task_exp_path", "task_same_scene_threshold",
         ]:
             kwargs.pop(k, None)
 
@@ -107,6 +113,18 @@ class MemVLAService:
             os.makedirs(os.path.dirname(os.path.abspath(exp_diag_path)), exist_ok=True)
         self.episode = None
 
+        # Trained task memory (optional): experiences then feed its branch instead of being pinned into the banks
+        self.task_library = None
+        self.task_same_scene_threshold = task_same_scene_threshold
+        self.task_episode_info = {}
+        if task_memory_ckpt:
+            assert task_exp_path, "`--task_memory_ckpt` needs `--task_exp_path` (built by build_experiences.py)"
+            task_memory, _ = load_task_memory(task_memory_ckpt)
+            task_memory = task_memory.to("cuda", dtype=next(self.vla.action_model.parameters()).dtype).eval()
+            task_memory.set_collect_diag(exp_diag)
+            self.vla.attach_task_memory(task_memory)
+            self.task_library = TaskExperienceLibrary(task_exp_path)
+
         self.args = args
         self.reset()
 
@@ -131,7 +149,14 @@ class MemVLAService:
 
         exp_mode = meta.get("exp_mode", "none")
         metas, cog_entries, per_entries = [], [], []
-        if exp_mode != "none":
+        self.task_episode_info = {}
+        if self.task_library is not None:
+            self.vla.clear_task_experience()
+            if exp_mode != "none":
+                # Picked on the first frame, once its tokens can be compared with the library (same-scene exclusion);
+                # the picks are reported by /end_episode
+                self.vla.set_task_experience(selector=partial(self._select_task_experience, dict(meta), seed))
+        elif exp_mode != "none":
             assert self.exp_store is not None, "Start the server with `--exp_store_dir` to use experiences"
             metas = self.exp_store.query(
                 exp_mode, meta["suite"], int(meta["task_id"]), int(meta["init_id"]),
@@ -161,13 +186,33 @@ class MemVLAService:
             "num_pinned_per": len(per_entries),
         }
 
+    def _select_task_experience(self, meta: dict, seed: int, first_cog: torch.Tensor, first_per: torch.Tensor):
+        picked = self.task_library.select(
+            meta["exp_mode"], meta["suite"], int(meta["task_id"]), int(meta["init_id"]), int(meta.get("exp_k", 1)),
+            seed, target_color=meta.get("target_color"), signature=scene_signature(first_per).cpu(),
+            same_scene_threshold=self.task_same_scene_threshold,
+        )
+        if picked is None:
+            self.task_episode_info = {"experiences": [], "num_pinned_cog": 0, "num_pinned_per": 0}
+            return None
+        cog, per, names, info = picked
+        num_entries = cog.shape[0] * cog.shape[1]
+        self.task_episode_info = {
+            "experiences": names, "num_pinned_cog": num_entries, "num_pinned_per": num_entries, **info,
+        }
+        dtype = next(self.vla.task_memory.parameters()).dtype
+        return cog.to("cuda", dtype), per.to("cuda", dtype)
+
     def end_episode(self, success: bool, info: dict) -> dict:
         episode, self.episode = self.episode, None
         self.vla.cog_mem_bank.clear_pinned()
         self.vla.per_mem_bank.clear_pinned()
+        task_info, self.task_episode_info = self.task_episode_info, {}
+        if self.task_library is not None:
+            self.vla.clear_task_experience()
 
         if episode is None or not episode["record"] or len(episode["cog"]) == 0:
-            return {"saved": None}
+            return {"saved": None, **task_info}
 
         meta = {**episode["meta"], **info, "success": bool(success), "num_calls": len(episode["cog"])}
         path = self.exp_store.save(
@@ -177,7 +222,7 @@ class MemVLAService:
             actions=np.stack(episode["actions"]),
             timesteps=np.asarray(episode["timesteps"]),
         )
-        return {"saved": path}
+        return {"saved": path, **task_info}
 
     def step(
         self,
@@ -324,6 +369,9 @@ parser.add_argument("--exp_pin_target", type=str, default="both", choices=["both
 parser.add_argument("--preserve_unmasked_actions", action="store_true")
 parser.add_argument("--exp_diag", action="store_true")
 parser.add_argument("--exp_diag_path", type=str, default=None)
+parser.add_argument("--task_memory_ckpt", type=str, default=None)
+parser.add_argument("--task_exp_path", type=str, nargs="+", default=None)
+parser.add_argument("--task_same_scene_threshold", type=float, default=0.995)
 
 args = parser.parse_args()
 
@@ -364,6 +412,9 @@ inferencer = MemVLAService(
     preserve_unmasked_actions=args.preserve_unmasked_actions,
     exp_diag=args.exp_diag,
     exp_diag_path=args.exp_diag_path,
+    task_memory_ckpt=args.task_memory_ckpt,
+    task_exp_path=args.task_exp_path,
+    task_same_scene_threshold=args.task_same_scene_threshold,
     args=args,
 )
 

@@ -53,10 +53,14 @@ def make_dataset_from_rlds(
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
     load_all_data_for_training: bool = True,
+    keep_traj_metadata: bool = False,
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
     format. Yields a dataset of trajectories. Does not include CPU-intensive operations.
+
+    `keep_traj_metadata` keeps dlimp's per-step `traj_metadata` and `_traj_index` entries (episode metadata and index),
+    which offline tools use to identify episodes; training leaves it off.
 
     If `standardize_fn` is provided, it will be applied to each trajectory. This function should get the trajectory
     into a standard format, which includes the keys "observation" and "action". Entry "observation" should be a
@@ -179,11 +183,13 @@ def make_dataset_from_rlds(
                 )
             task["language_instruction"] = traj.pop(language_key)
 
+        extra = {k: traj[k] for k in ("traj_metadata", "_traj_index") if keep_traj_metadata and k in traj}
         traj = {
             "observation": new_obs,
             "task": task,
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
+            **extra,
         }
 
         if absolute_action_mask is not None:

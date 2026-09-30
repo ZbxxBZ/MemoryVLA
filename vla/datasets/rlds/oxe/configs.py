@@ -687,4 +687,13 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
+
+    ### MIKASA-Robo (same entry as the upstream `mikasa-robo` branch that trained memvla-mikasa.pt)
+    "mikasa_dataset": {
+        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": "wrist_image"},
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": [None, None, None, None, None, None, None, None],
+        "state_encoding": StateEncoding.NONE,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
 }

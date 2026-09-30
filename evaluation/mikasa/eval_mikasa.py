@@ -105,6 +105,7 @@ def main() -> None:
     parser.add_argument("--action_scale", type=float, default=1.0)
     parser.add_argument("--record_experience", action="store_true")
     parser.add_argument("--run_id_note", default="")
+    parser.add_argument("--model_tag", default="base", help="Which policy served the run (e.g. base / task / control)")
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=2345)
     args = parser.parse_args()
@@ -115,7 +116,7 @@ def main() -> None:
     task, env_id, instruction, max_steps = TASKS[args.task_id]
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    results_path = args.log_dir / f"mikasa-task{args.task_id}-{args.run_id_note}-{stamp}_results.jsonl"
+    results_path = args.log_dir / f"mikasa-{args.model_tag}-task{args.task_id}-{args.run_id_note}-{stamp}_results.jsonl"
     policy = MikasaClient(base_url=f"http://127.0.0.1:{args.port}")
     env = make_env(env_id)
 
@@ -163,9 +164,13 @@ def main() -> None:
                     if not finished:
                         success = success_once
 
-                    policy.end_episode(success, env_steps=steps, target_color=target_color, env_seed=env_seed)
+                    end_info = policy.end_episode(success, env_steps=steps, target_color=target_color, env_seed=env_seed)
+                    # The trained task-memory route picks experiences on the first frame and reports them here
+                    exp_info = {**exp_info, **{k: end_info[k] for k in ("experiences", "num_pinned_cog",
+                                                                       "num_pinned_per") if k in end_info}}
                     row = {
                         "suite": "mikasa", "task_id": args.task_id, "task": task, "env_id": env_id,
+                        "model_tag": args.model_tag, "max_scene_sim": end_info.get("max_scene_sim"),
                         "init_id": init_id, "trial": trial, "seed": episode_seed, "seed_offset": args.seed_offset,
                         "exp_mode": args.exp_mode, "exp_k": args.exp_k, "record": args.record_experience,
                         "experiences": exp_info["experiences"],

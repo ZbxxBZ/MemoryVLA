@@ -510,6 +510,23 @@ class MemoryVLA(nn.Module):
     def freeze_backbones(self, stage):
         self.vlm.freeze_backbones(stage)
 
+    # === Trained cross-episode task memory (vla/task_memory.py); inactive unless attached and given experiences ===
+    def attach_task_memory(self, task_memory: nn.Module) -> None:
+        self.task_memory = task_memory
+        self.clear_task_experience()
+
+    def set_task_experience(self, cog_exp=None, per_exp=None, selector=None) -> None:
+        """
+        Experiences for the current episode: episodic fused tokens at K keyframes, cog_exp [S, K, D_cog] and
+        per_exp [S, K, N, D_per]; or `selector(first_cog [D_cog], first_per [N, D_per])`, called on the first frame,
+        returning that pair (or None).
+        """
+        self.task_exp = None if cog_exp is None else (cog_exp, per_exp)
+        self.task_exp_selector = selector
+
+    def clear_task_experience(self) -> None:
+        self.task_exp, self.task_exp_selector = None, None
+
     def forward(
         self,
         input_ids: torch.LongTensor=None,
@@ -817,6 +834,9 @@ class MemoryVLA(nn.Module):
             saved_rng = torch.get_rng_state()
             saved_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             saved_cog_diag, saved_per_diag = cog_bank.exp_diag_enabled, per_bank.exp_diag_enabled
+            # The shadow pass is the "no experience" reference, so it also skips the trained task memory
+            saved_task_state = (getattr(self, "task_exp", None), getattr(self, "task_exp_selector", None))
+            self.task_exp, self.task_exp_selector = None, None
             cog_bank.exp_diag_enabled = per_bank.exp_diag_enabled = False
             cog_bank.clear_pinned()
             per_bank.clear_pinned()
@@ -840,6 +860,7 @@ class MemoryVLA(nn.Module):
                 cog_bank.set_pinned(saved_cog_pinned)
                 per_bank.set_pinned(saved_per_pinned)
                 cog_bank.exp_diag_enabled, per_bank.exp_diag_enabled = saved_cog_diag, saved_per_diag
+                self.task_exp, self.task_exp_selector = saved_task_state
                 torch.set_rng_state(saved_rng)
                 if saved_cuda_rng is not None:
                     torch.cuda.set_rng_state_all(saved_cuda_rng)
@@ -860,6 +881,26 @@ class MemoryVLA(nn.Module):
             episode_ids=episode_ids,
             timesteps=timesteps,
         )
+
+        # Trained task memory: the working memory also reads keyframes of other episodes (see vla/task_memory.py)
+        task_memory = getattr(self, "task_memory", None)
+        task_active = False
+        if task_memory is not None:
+            selector = getattr(self, "task_exp_selector", None)
+            if selector is not None:
+                # Experiences picked on the first frame, so they can be checked against this episode's scene
+                self.task_exp_selector = None
+                self.task_exp = selector(raw_cog_tokens[0, 0], raw_per_tokens[0])
+            if getattr(self, "task_exp", None) is not None:
+                cog_exp, per_exp = self.task_exp
+                task_dtype = next(task_memory.parameters()).dtype
+                cog_delta, per_delta = task_memory(
+                    raw_cog_tokens.to(task_dtype), raw_per_tokens.to(task_dtype),
+                    cog_exp[None].to(task_dtype), per_exp[None].to(task_dtype),
+                )
+                cog_tokens = cog_tokens + cog_delta.to(cog_tokens.dtype)
+                per_tokens = per_tokens + per_delta.to(per_tokens.dtype)
+                task_active = True
 
         # Sample random noise
         B = cog_tokens.shape[0]
@@ -935,6 +976,8 @@ class MemoryVLA(nn.Module):
                 "per_gate_scale": self.per_mem_bank.last_diagnostics["gate_scale"],
                 "action_offset_l2": action_offset,
             }
+            if task_active:
+                self.last_exp_diagnostics.update(task_memory.last_diagnostics)
 
         if return_features:
             features = {"cog": raw_cog_tokens[0, 0], "per": raw_per_tokens[0]}  # [D_cog], [N, D_per]

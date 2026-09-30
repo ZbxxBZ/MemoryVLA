@@ -1,6 +1,68 @@
-# MemoryVLA · 跨 episode 经验预填（免训练版）
+# MemoryVLA · 训练版跨 episode task memory
 
-> 本分支 `training-free-prefill` 基于官方 [MemoryVLA](https://github.com/shihao1895/MemoryVLA)（OpenVLA codebase，`openvla-codebase` 分支）。它**不做任何训练**，直接把**其他 episode** 的记忆 token 预填进 MemoryVLA 的记忆库，检验模型能否利用跨 episode 的经验。原仓库的 README 保留在本文后半部分。
+> 本分支 `task-memory-trained` 在 `training-free-prefill`（免训练预填，说明见下文第二部分）的基础上，新增一路**需要训练**的 task memory 分支。免训练实验的结论是：把经验直接塞进原记忆库，模型分不清真实经验和噪声。所以这里单独加一路检索，专门训练它去读经验。**状态：代码已写完，还没在服务器上跑过。**
+
+## 结构
+
+```
+当前帧 → VLM（冻结）→ 原始 cog/per token（working memory，作为 Q）
+            ├→ 原记忆库 PCMB 检索 + GateFusion（冻结）→ fused
+            └→ task memory 检索（新增，训练）
+                   K/V：同任务、其他 episode、其他场景的成功轨迹，8 个关键帧的 fused token
+输出 = fused + a·Wo(t) → DiT 动作头（冻结）
+```
+
+- **Q**：当前帧的原始 token（和原检索相同）。
+- **K/V**：经验轨迹在 8 个均匀关键帧上的 **fused token**（经过原记忆库检索和 GateFusion 之后的 token）。位置编码用关键帧序号和经验槽位，不用绝对时间步，因为训练时的时间步是环境帧号，部署时是调用次数，两者不一致。
+- **检索层**：2 层多头交叉注意力。per 在 256 维上做，cog 先降到 1024 维，整个分支约 4 千万参数。
+- **注入**：`fused + a·Wo(t)`，`a` 是每个 token 一个标量门，`Wo` 零初始化。训练开始时，以及一局没有给经验时，模型和原来完全一样。
+- **冻结范围**：VLM、感知压缩、原记忆库、DiT 全部冻结，只训练新分支。原记忆库之前的部分冻结，所以每帧 token 可以预先缓存，训练时不用跑 7B 模型。
+
+代码：[vla/task_memory.py](vla/task_memory.py)（分支、只加载记忆库和动作头的轻量加载器、按部署方式回放原记忆库），`MemoryVLA.attach_task_memory / set_task_experience`（[vla/memory_vla.py](vla/memory_vla.py)），经验库 `TaskExperienceLibrary`（[vla/experience.py](vla/experience.py)）。
+
+## 训练流程（`script/train/task_memory/`）
+
+| 步骤 | 脚本 | 作用 |
+|---|---|---|
+| 1 | `inspect_dataset.py` | 检查 RLDS 训练数据：episode 数和长度、指令、元数据。RC3/RC5/RC9 的指令相同，要靠元数据区分任务 |
+| 2 | `cache_tokens.py` | 冻结的 VLM 跑一遍所有帧，存原始 cog/per token 和动作块，走训练时的 RLDS 预处理（不做增强）。可按 GPU 分片，中断后可续跑 |
+| 3 | `build_experiences.py` | 按部署方式（每 4 帧调用一次）回放原记忆库，取 8 个关键帧的 fused token 打包成经验库，同时统计每个任务的噪声分布和"最近场景相似度" |
+| 4 | `train_task_memory.py` | 训练分支。每步取 4 条 episode、各 16 帧（同原训练的 group 采样），经验从同任务的其他 episode 中随机抽，排除同场景（第一帧相似度 ≥ 阈值）；20% 概率换成别的任务的经验作为干扰。`--exp_content noise` 训练对照模型（经验换成同分布噪声，其余完全相同）。每 500 步在留出的 episode 上用相同的扩散噪声比较真实、噪声、别任务、无经验四种条件的 loss |
+
+一键跑完（完成的阶段会跳过）：
+
+```bash
+CKPT_PATH=/path/to/memvla-mikasa.pt DATA_ROOT=/path/to/mikasa-rlds GPUS="0 1" bash script/train/task_memory/run_pipeline.sh
+```
+
+可选环境变量：`WORK_DIR`（缓存和经验库，默认 `./cache/task_memory`）、`LOG_DIR`（默认 `./log/task_memory`）、`ROLLOUT_STORE`（部署时录的 ExperienceStore，例如第二轮的 `exp_store/mikasa_r2`，用来做颜色对照）、`TASK_MAP`（元数据无法区分任务时，手写 `{子串: task_id}` 的 JSON）、`TRAIN_STEPS`、`TRAIN_ARGS`。
+
+## 评测（`script/eval/mikasa/probe_task_memory.sh`）
+
+协议和种子与免训练第二轮相同：IM / RC3 / RC5，30 个起点 × 4 次，结果可以逐条配对。
+
+| 模型 | 经验 | 作用 |
+|---|---|---|
+| 主模型 | 无（分支不工作 = 原模型） | 基线；同时检查和第二轮逐条是否一致 |
+| 主模型 | 同任务其他场景的演示（真实） | 主结果 |
+| 对照模型 | 同上 | 扣掉"多训练、多一层网络"的效果 |
+| 主模型 | 噪声 / 别任务经验 | 内容是否起作用 / 无关经验是否被忽略 |
+| 主模型 | 部署录制的经验，同色 / 异色（仅 RC） | 是否照抄颜色 |
+
+```bash
+CKPT_PATH=... TASK_MEM=log/task_memory/main/task_memory_last.pt CTRL_MEM=log/task_memory/control/task_memory_last.pt \
+  DEMO_LIB=cache/task_memory/demo_library.pt bash script/eval/mikasa/probe_task_memory.sh
+```
+
+`analyze_task_memory.py` 输出各组成功率、CMH 检验（按任务和起点分层）、Holm 校正、配对 McNemar，以及按起点重抽样的 95% 置信区间。事先定好的判定：主模型 + 真实经验要**同时**显著好于"对照模型 + 真实经验"和"主模型 + 噪声"，才算分支用上了经验的内容。
+
+`deploy.py` 新增参数：`--task_memory_ckpt`、`--task_exp_path`（可传多个经验库）、`--task_same_scene_threshold`。经验在每局第一帧选定，此时可以和经验库比对场景，排除同场景的经验；选中的经验由 `/end_episode` 返回，写进结果文件。
+
+---
+
+# 第二部分：跨 episode 经验预填（免训练版）
+
+> 以下是 `training-free-prefill` 分支的说明。该分支基于官方 [MemoryVLA](https://github.com/shihao1895/MemoryVLA)（OpenVLA codebase，`openvla-codebase` 分支）。它**不做任何训练**，直接把**其他 episode** 的记忆 token 预填进 MemoryVLA 的记忆库，检验模型能否利用跨 episode 的经验。原仓库的 README 保留在本文后半部分。
 
 ## 做了什么
 

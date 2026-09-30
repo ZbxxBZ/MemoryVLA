@@ -273,3 +273,83 @@ class ExperienceStore:
                         feat = per[i]
                     per_entries.append((t, feat.to(device, per_dtype)))
         return cog_entries, per_entries
+
+
+class TaskExperienceLibrary:
+    """
+    Experiences for the trained task-memory branch (vla/task_memory.py), packed by
+    script/train/task_memory/build_experiences.py:
+        {"meta": [dict, ...], "cog": [E, K, D_cog], "per": [E, K, N, D_per], "noise_stats": {"<suite>/<task_id>": {...}}}
+    "cog" / "per" hold the episodic *fused* tokens at K uniform keyframes; each meta has name, suite, task_id, init_id
+    (-1 when unknown, e.g. demonstrations), success, target_color and source.
+    """
+
+    def __init__(self, paths: List[str]) -> None:
+        metas, cogs, pers, self.noise_stats = [], [], [], {}
+        for path in paths:
+            data = torch.load(path, map_location="cpu", weights_only=False)
+            metas += data["meta"]
+            cogs.append(data["cog"])
+            pers.append(data["per"])
+            self.noise_stats.update(data.get("noise_stats", {}))
+        self.meta, self.cog, self.per = metas, torch.cat(cogs), torch.cat(pers)
+        # Keyframe 0 is the first frame, whose fused tokens equal its raw tokens (the episodic memory is still empty),
+        # so it doubles as a scene signature for skipping experiences recorded in the current scene.
+        self.signature = F.normalize(self.per[:, 0].flatten(1).float(), dim=-1).half()
+        print(f"*** TaskExperienceLibrary: {len(self.meta)} experiences from {paths} ***")
+
+    def select(
+        self,
+        mode: str,
+        suite: str,
+        task_id: int,
+        init_id: int,
+        k: int,
+        seed: int,
+        target_color: Optional[int] = None,
+        signature: Optional[torch.Tensor] = None,
+        same_scene_threshold: float = 0.995,
+    ):
+        """Return (cog [k, K, D], per [k, K, N, D], names, info), or None when no experience qualifies."""
+        seed = int(seed) % (2**32)
+        if mode == "noise":
+            stats = self.noise_stats[f"{suite}/{task_id}"]
+            generator = torch.Generator().manual_seed(seed)
+            K, N = self.per.shape[1], self.per.shape[2]
+            cog = stats["cog_mean"] + torch.randn((k, K, self.cog.shape[-1]), generator=generator) * stats["cog_std"]
+            per = stats["per_mean"] + torch.randn((k, K, N, self.per.shape[-1]), generator=generator) * stats["per_std"]
+            return cog, per, [f"noise_{suite}_task{task_id}"] * k, {}
+
+        def ok(m, same_task=True):
+            return m["suite"] == suite and (m["task_id"] == task_id) == same_task
+
+        if mode == "other_task_success":
+            candidates = [i for i, m in enumerate(self.meta) if ok(m, same_task=False) and m["success"]]
+        elif mode == "other_init_success":
+            candidates = [i for i, m in enumerate(self.meta) if ok(m) and m["success"] and m["init_id"] != init_id]
+        elif mode in ("other_init_success_same_color", "other_init_success_diff_color"):
+            want_same = mode == "other_init_success_same_color"
+            candidates = [
+                i for i, m in enumerate(self.meta)
+                if ok(m) and m["success"] and m["init_id"] != init_id and target_color is not None
+                and m.get("target_color") is not None and (m["target_color"] == target_color) == want_same
+            ]
+        elif mode in ("same_init_success", "same_init_failure"):
+            want_success = mode == "same_init_success"
+            candidates = [
+                i for i, m in enumerate(self.meta) if ok(m) and m["init_id"] == init_id and m["success"] == want_success
+            ]
+        else:
+            raise ValueError(f"Unsupported task-memory experience mode `{mode}`")
+
+        info = {"num_candidates": len(candidates)}
+        if signature is not None and candidates and mode not in ("same_init_success", "same_init_failure"):
+            sims = self.signature[candidates].float() @ signature.float()
+            info["max_scene_sim"] = float(sims.max())
+            candidates = [c for c, sim in zip(candidates, sims.tolist()) if sim < same_scene_threshold]
+            info["num_candidates"] = len(candidates)
+        if not candidates:
+            return None
+        order = np.random.RandomState(seed).permutation(len(candidates))[:k]
+        chosen = [candidates[i] for i in order]
+        return self.cog[chosen], self.per[chosen], [self.meta[i]["name"] for i in chosen], info
