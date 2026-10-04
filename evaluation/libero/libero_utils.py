@@ -13,11 +13,13 @@ from robot_utils import (
 )
 
 
-def get_libero_env(task, resolution=256):
+def get_libero_env(task, resolution=256, agentview_only=False):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    if agentview_only:  # the policy only reads `agentview_image`; skipping the wrist camera halves the render cost
+        env_args["camera_names"] = ["agentview"]
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

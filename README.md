@@ -245,6 +245,29 @@ We provide evaluation interfaces and scripts based on [SimplerEnv](https://simpl
 
    To finetune on your own customized data, please follow the instruction [(rlds_dataset_builder)](https://github.com/kpertsch/rlds_dataset_builder) for converting your data to RLDS format. The actions should be the deltas of end effector ``EEF Delta XYZ (3) + Roll-Pitch-Yaw (3) + Gripper Open/Close (1)``. Once your customized data is ready, place the customized data directly under the ``<data_root_dir>/custom_finetuning/1.0.0`` directory. Then set ``vla.data_mix="custom_finetuning"``.
 
+## Cross-Episode Experience Retrieval (branch `experience-retrieval`)
+
+A second, cross-episode memory read by the action head, kept apart from the episodic memory banks
+([vla/experience_retrieval.py](vla/experience_retrieval.py)):
+
+- **Store**: per task, past episodes (training demos and the policy's own rollouts), each with per-call retrieval keys
+  (unit raw cog tokens), the normalized action chunk executed from every call, its outcome and a first-frame signature.
+- **Retrieval**: on the first call, the most similar successful episodes of the task become references; each keeps a
+  forward-only pointer that moves, every call, to the most similar key within the next few calls of that reference.
+- **Reading**: each reference's action chunk at its pointer, with progress / similarity / outcome, becomes one token;
+  tanh-gated cross-attention layers (gates initialized at zero) after the DiT blocks read them. Without references the
+  model is the original one.
+
+Train the adapter on cached tokens (the base checkpoint stays frozen), then evaluate the conditions on one server:
+
+```bash
+CKPT_PATH=/path/to/run/checkpoints/x.pt DATA_ROOT=/path/to/libero-rlds DATASET=libero_goal_no_noops GPUS="0 1" \
+  bash script/train/experience/run_pipeline.sh
+CKPT_PATH=/path/to/run/checkpoints/x.pt ADAPTER=log/experience/libero_goal_no_noops/main/adapter_last.pt \
+  LIBRARY=cache/experience/libero_goal_no_noops/library.pt SUITE=libero_goal TRIALS_PER_INIT=3 \
+  bash script/eval/libero/eval_experience.sh
+```
+
 ## Deployment in the Real World
 
 To deploy the model on your own robot, first collect corresponding real-world manipulation data (e.g., via teleoperation), and use it to fine-tune the pretrained model.

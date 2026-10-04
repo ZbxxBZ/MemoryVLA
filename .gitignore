@@ -147,3 +147,8 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+# Experience-retrieval outputs (kept locally, not versioned)
+log/
+logs/
+resized_image.png

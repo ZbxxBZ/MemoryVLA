@@ -442,6 +442,10 @@ class MemoryVLA(nn.Module):
             per_token_size=per_token_size,
         )
 
+        # Cross-episode experience retrieval (vla/experience_retrieval.py): `exp_provider(raw_cog [D], raw_per [N, Dp])`
+        # returns the reference features of the current call (or None); set per episode by the deployment server
+        self.exp_provider = None
+
         self.all_module_keys = []
         self._trainable_module_keys = []
 
@@ -476,6 +480,10 @@ class MemoryVLA(nn.Module):
     
     def freeze_backbones(self, stage):
         self.vlm.freeze_backbones(stage)
+
+    def attach_exp_adapter(self, adapter: nn.Module) -> None:
+        """Trained experience adapter read by the action head (inactive for calls without references)."""
+        self.action_model.net.attach_exp_adapter(adapter)
 
     def forward(
         self,
@@ -772,6 +780,11 @@ class MemoryVLA(nn.Module):
         timesteps = [torch.tensor(self.cur_timestep, device=cog_tokens.device)]
         self.cur_timestep += 1
 
+        # Experience references are retrieved with the raw (pre-memory) tokens of this frame
+        exp = None
+        if self.exp_provider is not None:
+            exp = self.exp_provider(cog_tokens[0, 0], per_tokens[0])
+
         cog_tokens = self.cog_mem_bank.process_batch(
             tokens=cog_tokens,
             episode_ids=episode_ids,
@@ -800,10 +813,14 @@ class MemoryVLA(nn.Module):
             model_kwargs = dict(z=z, cfg_scale=cfg_scale)
             sample_fn = self.action_model.net.forward_with_cfg
             model_kwargs.update({'per_token': per_tokens.repeat(2, 1, 1)})  # Repeat for unconditioned and conditioned samples
+            if exp is not None:  # both halves read the references, like the perceptual tokens
+                model_kwargs['exp'] = {k: torch.cat([v, v], dim=0) for k, v in exp.items()}
         else:
             model_kwargs = dict(z=cog_tokens)
             sample_fn = self.action_model.net.forward
             model_kwargs.update({'per_token': per_tokens})
+            if exp is not None:
+                model_kwargs['exp'] = exp
 
         # DDIM Sampling
         if use_ddim and num_ddim_steps is not None:

@@ -245,6 +245,13 @@ class DiT(nn.Module):
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         self.initialize_weights()
 
+        # Optional cross-episode experience adapter (vla/experience_retrieval.py), attached after loading the base
+        # weights; without it, or without experiences, the forward pass is the original one
+        self.exp_adapter = None
+
+    def attach_exp_adapter(self, adapter) -> None:
+        self.exp_adapter = adapter
+
     def initialize_weights(self):
         # Initialize transformer layers:
         def _basic_init(module):
@@ -276,13 +283,14 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x, t, z, per_token=None):
+    def forward(self, x, t, z, per_token=None, exp=None):
         """
         Forward pass of DiT.
         history: (N, H, D) tensor of action history # not used now
         x: (N, T, D) tensor of predicting action inputs
         t: (N,) tensor of diffusion timesteps
         z: (N, 1, D) tensor of conditions
+        exp: optional dict of retrieved experience features, read by `exp_adapter` after every block
         """
         x = self.x_embedder(x)                              # (N, T, D)
         t = self.t_embedder(t)                              # (N, D)
@@ -291,25 +299,32 @@ class DiT(nn.Module):
         if self.use_per_attn:
             per_token = self.per_token_embedder(per_token)      # (N, P, D_per)
 
+        exp_tokens = None
+        if exp is not None and self.exp_adapter is not None:
+            exp_tokens = self.exp_adapter.encode(exp)       # (tokens, attend mask, active)
+
         c = t.unsqueeze(1) + z                              # (N, 1, D)
         x = torch.cat((c, x), dim=1)                        # (N, T+1, D)
         x = x + self.positional_embedding                   # (N, T+1, D)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, per_token)                                    # (N, T+1, D)
+            if exp_tokens is not None:
+                x = self.exp_adapter.inject(i, x, exp_tokens)
         x = self.final_layer(x)                             # (N, T+1, out_channels)
         # print('parameters', self.final_layer, self.final_layer.parameters())
         return x[:, 1:, :]     # (N, T, C)
 
-    def forward_with_cfg(self, x, t, z, cfg_scale, per_token):
+    def forward_with_cfg(self, x, t, z, cfg_scale, per_token, exp=None):
         """
         Forward pass of Diffusion, but also batches the unconditional forward pass for classifier-free guidance.
+        `exp`, like `per_token`, must already be repeated for both halves.
         """
 
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0).to(
             next(self.x_embedder.parameters()).dtype)
-        model_out = self.forward(combined, t, z, per_token)
+        model_out = self.forward(combined, t, z, per_token, exp=exp)
         # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         eps, rest = model_out[:, :,
                               :self.in_channels], model_out[:, :, self.in_channels:]

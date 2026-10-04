@@ -4,12 +4,21 @@ import requests
 
 
 class LLaVAClient:
-    def __init__(self, base_url='http://localhost:6800'):
+    def __init__(self, base_url='http://localhost:6800', session='default'):
         self.base_url = base_url
+        self.session = session  # server-side memory / RNG state, so several clients can share one server
 
     def reset(self):
         # return requests.post(self.base_url+"/reset").json().get('response')
         pass
+
+    def start_episode(self, **meta):
+        # meta: task_key, seed, condition, store, sources, record, num_refs, select, ... (see deploy.py)
+        return requests.post(self.base_url + "/start_episode", json={**meta, "session": self.session}).json()
+
+    def end_episode(self, success, **info):
+        return requests.post(self.base_url + "/end_episode",
+                             json={"success": bool(success), "info": info, "session": self.session}).json()
 
     def process_frame(self, text, episode_first_frame, **kwargs):
         state = kwargs.pop('states', None)
@@ -29,7 +38,7 @@ class LLaVAClient:
 
         ret = requests.post(
             self.base_url+"/process_frame",
-            data={"text": text, 'episode_first_frame': episode_first_frame,},
+            data={"text": text, 'episode_first_frame': episode_first_frame, "session": self.session},
 
             files={"image": encoded_imgs.pop('base_cam', None),
                     **({"states": ("states.npy", state.tobytes()) } if state is not None else {}),

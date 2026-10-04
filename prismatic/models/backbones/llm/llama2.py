@@ -4,6 +4,7 @@ llama2.py
 Class definition for all LLMs derived from LlamaForCausalLM.
 """
 
+import os
 from typing import Optional, Sequence, Type
 
 import torch
@@ -24,7 +25,8 @@ from prismatic.models.backbones.llm.prompting import (
 LLAMA2_MODELS = {
     # === Pure Meta LLaMa-2 (non-instruct/chat-tuned) Models ===
     "llama2-7b-pure": {
-        "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "meta-llama/Llama-2-7b-hf"
+        "llm_family": "llama2", "llm_cls": LlamaForCausalLM,
+        "hf_hub_path": os.environ.get("MEMVLA_LLAMA2_7B_PATH", "meta-llama/Llama-2-7b-hf")
     },
 
     "llama2-13b-pure": {

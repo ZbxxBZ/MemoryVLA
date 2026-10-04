@@ -1,3 +1,11 @@
 from .memory_vla import MemoryVLA
 from .load import available_model_names, available_models, get_model_description, load, load_vla
-from .materialize import get_vla_dataset_and_collator
+
+
+def __getattr__(name):
+    # Imported lazily: the dataset stack pulls in TensorFlow, which the offline experience tools do not need
+    if name == "get_vla_dataset_and_collator":
+        from .materialize import get_vla_dataset_and_collator
+
+        return get_vla_dataset_and_collator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
